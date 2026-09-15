@@ -1,0 +1,53 @@
+services:
+  postgres-dev:
+    image: postgres:17-alpine
+    profiles: [dev]
+    environment:
+      POSTGRES_DB: preflight
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes: [postgres-dev:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d preflight]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./backend
+    profiles: [dev]
+    environment:
+      ConnectionStrings__DefaultConnection: Host=postgres-dev;Database=preflight;Username=postgres;Password=postgres
+      ASPNETCORE_URLS: http://+:8080
+      Cors__AllowedOrigin: http://localhost:${FRONTEND_HOST_PORT:-5173}
+    ports: ["${API_HOST_PORT:-8080}:8080"]
+    depends_on:
+      postgres-dev: {condition: service_healthy}
+    develop:
+      watch:
+        - action: sync
+          path: ./backend
+          target: /src
+          ignore: [bin/, obj/]
+        - action: rebuild
+          path: ./backend/Preflight.Api.csproj
+
+  frontend:
+    build: ./frontend
+    profiles: [dev]
+    environment:
+      VITE_API_BASE_URL: http://localhost:${API_HOST_PORT:-8080}
+    ports: ["${FRONTEND_HOST_PORT:-5173}:5173"]
+    depends_on:
+      api: {condition: service_started}
+    develop:
+      watch:
+        - action: sync
+          path: ./frontend
+          target: /app
+          ignore: [node_modules/, dist/]
+        - action: rebuild
+          path: ./frontend/package.json
+
+volumes:
+  postgres-dev:
