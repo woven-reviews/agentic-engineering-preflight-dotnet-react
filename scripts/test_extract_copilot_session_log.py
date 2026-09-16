@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 import sqlite3
 import tempfile
@@ -17,8 +16,11 @@ from pathlib import Path
 import extract_copilot_session_log as copilot_log
 from extract_copilot_session_log import (
     Turn,
+    build_events,
     _permissions_from_events,
+    _skills_from_events,
     attribute_permissions,
+    attribute_skills,
     clean_user_text,
     format_decision,
     get_db_connection,
@@ -38,9 +40,64 @@ def test_copilot_noise_cleaning():
     assert clean_user_text("<system-notification>test</system-notification>") == ""
     assert clean_user_text("<bash-stdout>output</bash-stdout>") == ""
     assert (
-        clean_user_text("Real text\n<system-reminder>ignore</system-reminder>\nMore text")
+        clean_user_text(
+            "Real text\n<system-reminder>ignore</system-reminder>\nMore text"
+        )
         == "Real text\n\nMore text"
     )
+
+
+def test_copilot_skill_invocation_is_recorded_and_attributed():
+    lines = [
+        json.dumps(
+            {
+                "type": "skill.invoked",
+                "timestamp": "2026-07-01T22:05:00Z",
+                "data": {
+                    "name": "extract-copilot-session-logs",
+                    "path": "/repo/.agents/skills/extract-copilot-session-logs/SKILL.md",
+                },
+            }
+        ),
+        json.dumps({"type": "assistant.message", "data": {}}),
+    ]
+    skills = _skills_from_events(lines)
+    assert skills == [
+        {
+            "name": "extract-copilot-session-logs",
+            "path": "/repo/.agents/skills/extract-copilot-session-logs/SKILL.md",
+            "timestamp": "2026-07-01T22:05:00Z",
+        }
+    ]
+    turn = Turn("export logs", "", "2026-07-01T22:00:00Z", 0)
+    attribute_skills([turn], skills)
+    assert turn.skills_used == ["extract-copilot-session-logs"]
+
+
+def test_copilot_skill_definition_details_are_loaded():
+    with tempfile.TemporaryDirectory() as tmp_name:
+        skill_path = Path(tmp_name) / "demo" / "SKILL.md"
+        skill_path.parent.mkdir()
+        skill_path.write_text(
+            "---\nname: demo\ndescription: Explains the demo workflow.\n---\n\n"
+            "# Demo Skill\n",
+            encoding="utf-8",
+        )
+        turn = Turn("use demo", "", "2026-07-01T22:00:00Z", 0)
+        attribute_skills(
+            [turn],
+            [
+                {
+                    "name": "demo",
+                    "path": str(skill_path),
+                    "timestamp": "2026-07-01T22:05:00Z",
+                }
+            ],
+        )
+        assert turn.skill_details["demo"]["description"] == (
+            "Explains the demo workflow."
+        )
+        assert turn.skill_details["demo"]["path"] == str(skill_path.resolve())
 
 
 def test_copilot_permissions_join_approval_and_denial():
@@ -128,8 +185,18 @@ def test_copilot_attribute_permissions_by_timestamp():
     t0 = Turn("first", "", "2026-07-01T22:00:00Z", 0)
     t1 = Turn("second", "", "2026-07-01T22:10:00Z", 1)
     perms = [
-        {"tool": "a", "decision": "approved", "feedback": "", "timestamp": "2026-07-01T22:05:00Z"},
-        {"tool": "b", "decision": "denied", "feedback": "no", "timestamp": "2026-07-01T22:15:00Z"},
+        {
+            "tool": "a",
+            "decision": "approved",
+            "feedback": "",
+            "timestamp": "2026-07-01T22:05:00Z",
+        },
+        {
+            "tool": "b",
+            "decision": "denied",
+            "feedback": "no",
+            "timestamp": "2026-07-01T22:15:00Z",
+        },
     ]
     attribute_permissions([t0, t1], perms)
     assert [p["tool"] for p in t0.permission_decisions] == ["a"]
@@ -396,13 +463,25 @@ def test_copilot_image_reference_without_attachment_is_flagged():
                 timestamp TEXT
             )
         """)
-        cursor.execute("CREATE TABLE session_files (session_id TEXT, file_path TEXT, tool_name TEXT, turn_index INTEGER, first_seen_at TEXT)")
-        cursor.execute("CREATE TABLE session_refs (session_id TEXT, ref_type TEXT, ref_value TEXT, turn_index INTEGER, created_at TEXT)")
-        cursor.execute("CREATE TABLE checkpoints (session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, created_at TEXT)")
+        cursor.execute(
+            "CREATE TABLE session_files (session_id TEXT, file_path TEXT, tool_name TEXT, turn_index INTEGER, first_seen_at TEXT)"
+        )
+        cursor.execute(
+            "CREATE TABLE session_refs (session_id TEXT, ref_type TEXT, ref_value TEXT, turn_index INTEGER, created_at TEXT)"
+        )
+        cursor.execute(
+            "CREATE TABLE checkpoints (session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, created_at TEXT)"
+        )
 
         cursor.execute(
             "INSERT INTO sessions (id, cwd, repository, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            ("img-session", str(Path.cwd()), "test/repo", "2026-01-01T12:00:00Z", "2026-01-01T12:00:00Z"),
+            (
+                "img-session",
+                str(Path.cwd()),
+                "test/repo",
+                "2026-01-01T12:00:00Z",
+                "2026-01-01T12:00:00Z",
+            ),
         )
         cursor.execute(
             "INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp) VALUES (?, ?, ?, ?, ?)",
@@ -459,14 +538,28 @@ def test_copilot_image_attachment_is_dumped_to_marker_path():
                     timestamp TEXT
                 )
             """)
-            cursor.execute("CREATE TABLE session_files (session_id TEXT, file_path TEXT, tool_name TEXT, turn_index INTEGER, first_seen_at TEXT)")
-            cursor.execute("CREATE TABLE session_refs (session_id TEXT, ref_type TEXT, ref_value TEXT, turn_index INTEGER, created_at TEXT)")
-            cursor.execute("CREATE TABLE checkpoints (session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, created_at TEXT)")
-            cursor.execute("CREATE TABLE attachments (session_id TEXT, display_name TEXT, path TEXT, type TEXT)")
+            cursor.execute(
+                "CREATE TABLE session_files (session_id TEXT, file_path TEXT, tool_name TEXT, turn_index INTEGER, first_seen_at TEXT)"
+            )
+            cursor.execute(
+                "CREATE TABLE session_refs (session_id TEXT, ref_type TEXT, ref_value TEXT, turn_index INTEGER, created_at TEXT)"
+            )
+            cursor.execute(
+                "CREATE TABLE checkpoints (session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, created_at TEXT)"
+            )
+            cursor.execute(
+                "CREATE TABLE attachments (session_id TEXT, display_name TEXT, path TEXT, type TEXT)"
+            )
 
             cursor.execute(
                 "INSERT INTO sessions (id, cwd, repository, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                ("img-session-2", str(Path.cwd()), "test/repo", "2026-01-01T12:00:00Z", "2026-01-01T12:00:00Z"),
+                (
+                    "img-session-2",
+                    str(Path.cwd()),
+                    "test/repo",
+                    "2026-01-01T12:00:00Z",
+                    "2026-01-01T12:00:00Z",
+                ),
             )
             cursor.execute(
                 "INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp) VALUES (?, ?, ?, ?, ?)",
@@ -491,7 +584,9 @@ def test_copilot_image_attachment_is_dumped_to_marker_path():
             markdown = render_session(conn, session)
             conn.close()
 
-            marker = re.search(r"\[Image dumped to `([^`]+)` — description pending\]", markdown)
+            marker = re.search(
+                r"\[Image dumped to `([^`]+)` — description pending\]", markdown
+            )
             assert marker is not None
             dumped = Path(marker.group(1))
             assert dumped.exists()
@@ -559,13 +654,25 @@ def test_copilot_image_attachment_from_state_events_is_dumped_to_marker_path():
                     timestamp TEXT
                 )
             """)
-            cursor.execute("CREATE TABLE session_files (session_id TEXT, file_path TEXT, tool_name TEXT, turn_index INTEGER, first_seen_at TEXT)")
-            cursor.execute("CREATE TABLE session_refs (session_id TEXT, ref_type TEXT, ref_value TEXT, turn_index INTEGER, created_at TEXT)")
-            cursor.execute("CREATE TABLE checkpoints (session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, created_at TEXT)")
+            cursor.execute(
+                "CREATE TABLE session_files (session_id TEXT, file_path TEXT, tool_name TEXT, turn_index INTEGER, first_seen_at TEXT)"
+            )
+            cursor.execute(
+                "CREATE TABLE session_refs (session_id TEXT, ref_type TEXT, ref_value TEXT, turn_index INTEGER, created_at TEXT)"
+            )
+            cursor.execute(
+                "CREATE TABLE checkpoints (session_id TEXT, checkpoint_number INTEGER, title TEXT, overview TEXT, created_at TEXT)"
+            )
 
             cursor.execute(
                 "INSERT INTO sessions (id, cwd, repository, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                ("img-session-3", str(Path.cwd()), "test/repo", "2026-01-01T12:00:00Z", "2026-01-01T12:00:00Z"),
+                (
+                    "img-session-3",
+                    str(Path.cwd()),
+                    "test/repo",
+                    "2026-01-01T12:00:00Z",
+                    "2026-01-01T12:00:00Z",
+                ),
             )
             cursor.execute(
                 "INSERT INTO turns (session_id, turn_index, user_message, assistant_response, timestamp) VALUES (?, ?, ?, ?, ?)",
@@ -586,7 +693,9 @@ def test_copilot_image_attachment_from_state_events_is_dumped_to_marker_path():
             markdown = render_session(conn, session)
             conn.close()
 
-            marker = re.search(r"\[Image dumped to `([^`]+)` — description pending\]", markdown)
+            marker = re.search(
+                r"\[Image dumped to `([^`]+)` — description pending\]", markdown
+            )
             assert marker is not None
             dumped = Path(marker.group(1))
             assert dumped.exists()
@@ -596,7 +705,207 @@ def test_copilot_image_attachment_from_state_events_is_dumped_to_marker_path():
             test_db.unlink()
 
 
+def _copilot_turn_with_image():
+    img = Path(tempfile.mkdtemp()) / "a.png"
+    img.write_bytes(base64.b64decode(_PNG_B64))
+    turn = Turn(
+        "look at [image: a.png] and fix it",
+        "Sure, fixing.",
+        "2026-08-01T10:00:00Z",
+        0,
+    )
+    turn.image_refs = [
+        {"name": "a.png", "path": str(img), "type": "image/png"},
+        {"name": "ghost.png"},
+    ]
+    turn.add_tool("str_replace_editor", "backend/app/models.py")
+    return turn
+
+
+def test_build_events_inlines_an_attachment_resolved_from_disk():
+    user = build_events([_copilot_turn_with_image()])[0]
+    assert base64.b64decode(user["images"][0]["data"]) == base64.b64decode(_PNG_B64)
+
+
+def test_build_events_records_an_inline_token_with_no_attachment():
+    # A [image: name] token with no matching attachment record is common in
+    # Copilot logs; it has to stay visible.
+    user = build_events([_copilot_turn_with_image()])[0]
+    assert user["images"][1] == {"unavailable": True, "ref": "ghost.png"}
+
+
+def test_build_events_recovers_tool_name_and_target():
+    events = build_events([_copilot_turn_with_image()])
+    call = next(c for e in events for c in e.get("tool_calls", []))
+    assert call["name"] == "str_replace_editor"
+    assert call["input"] == {"target": "backend/app/models.py"}
+
+
+def test_build_events_must_run_before_dump_images_mutates_user_text():
+    # dump_images appends "[Image ... description pending]" markers to
+    # turn.user_text in place. The envelope carries the candidate's text, not
+    # the markdown's annotation of it — so ordering is load-bearing.
+    turn = _copilot_turn_with_image()
+    events = build_events([turn])
+    copilot_log.dump_images([turn], "sess", dump_dir=Path(tempfile.mkdtemp()))
+    assert "description pending" in turn.user_text
+    assert "description pending" not in events[0]["text"]
+
+
+def test_build_events_emits_an_assistant_event_for_a_reply():
+    events = build_events([_copilot_turn_with_image()])
+    assistant = [e for e in events if e["role"] == "assistant"]
+    assert assistant and assistant[0]["text"] == "Sure, fixing."
+
+
+def test_copilot_tools_from_events_join_start_and_complete():
+    lines = [
+        json.dumps(
+            {
+                "type": "tool.execution_start",
+                "timestamp": "2026-07-01T22:00:01Z",
+                "data": {
+                    "toolCallId": "call_1",
+                    "toolName": "grep",
+                    "arguments": {"pattern": "audit"},
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "tool.execution_complete",
+                "timestamp": "2026-07-01T22:00:02Z",
+                "data": {
+                    "toolCallId": "call_1",
+                    "success": True,
+                    "result": {"content": "match a\nmatch b", "detailedContent": "x"},
+                },
+            }
+        ),
+    ]
+    tools = copilot_log._tools_from_events(lines)
+    assert len(tools) == 1
+    assert tools[0]["name"] == "grep"
+    assert tools[0]["arguments"] == {"pattern": "audit"}
+    assert tools[0]["success"] is True
+    # detailedContent is preferred as the fuller result text.
+    assert tools[0]["result"] == "x"
+
+
+def test_copilot_attribute_tools_populates_bullet_note_and_envelope():
+    turn = Turn("find audits", "", "2026-07-01T22:00:00Z", 0)
+    tools = [
+        {
+            "name": "grep",
+            "arguments": {"pattern": "audit"},
+            "success": True,
+            "result": "backend/app/models.py",
+            "timestamp": "2026-07-01T22:00:01Z",
+        }
+    ]
+    copilot_log.attribute_tools([turn], tools)
+    assert turn.tool_bullets == ["- grep -> audit"]
+    assert turn.result_notes == ["grep: backend/app/models.py"]
+    # Structured call is carried into the raw envelope with its result.
+    call = next(c for e in build_events([turn]) for c in e.get("tool_calls", []))
+    assert call["name"] == "grep"
+    assert call["input"] == {"pattern": "audit"}
+    assert call["result"] == "backend/app/models.py"
+
+
+def test_copilot_attribute_tools_flags_failure():
+    turn = Turn("run it", "", "2026-07-01T22:00:00Z", 0)
+    copilot_log.attribute_tools(
+        [turn],
+        [
+            {
+                "name": "bash",
+                "arguments": {"command": "false"},
+                "success": False,
+                "result": "boom",
+                "timestamp": "2026-07-01T22:00:01Z",
+            }
+        ],
+    )
+    assert turn.result_notes == ["bash: error: boom"]
+
+
+def test_copilot_attribute_tools_by_timestamp():
+    t0 = Turn("first", "", "2026-07-01T22:00:00Z", 0)
+    t1 = Turn("second", "", "2026-07-01T22:10:00Z", 1)
+    tools = [
+        {
+            "name": "view",
+            "arguments": {"path": "a.py"},
+            "success": True,
+            "result": "ok",
+            "timestamp": "2026-07-01T22:12:00Z",
+        }
+    ]
+    copilot_log.attribute_tools([t0, t1], tools)
+    assert t0.tool_bullets == []
+    assert t1.tool_bullets == ["- view -> a.py"]
+
+
+def test_copilot_build_events_emits_one_timestamped_event_per_tool_call():
+    turn = Turn("do two things", "On it.", "2026-07-01T22:00:00Z", 0)
+    copilot_log.attribute_tools(
+        [turn],
+        [
+            {
+                "name": "grep",
+                "arguments": {"pattern": "a"},
+                "success": True,
+                "result": "r1",
+                "timestamp": "2026-07-01T22:00:01Z",
+            },
+            {
+                "name": "view",
+                "arguments": {"path": "b.py"},
+                "success": True,
+                "result": "r2",
+                "timestamp": "2026-07-01T22:00:02Z",
+            },
+        ],
+    )
+    events = build_events([turn])
+    # user + assistant prose + one event per tool call.
+    assert [e["role"] for e in events] == ["user", "assistant", "assistant", "assistant"]
+    tool_events = [e for e in events if e.get("tool_calls")]
+    assert len(tool_events) == 2
+    # Each tool event carries exactly one call stamped with that call's own time.
+    assert tool_events[0]["ts"] == "2026-07-01T22:00:01Z"
+    assert tool_events[0]["tool_calls"][0]["name"] == "grep"
+    assert tool_events[1]["ts"] == "2026-07-01T22:00:02Z"
+    assert tool_events[1]["tool_calls"][0]["name"] == "view"
+    # Indices stay contiguous across the split-out events.
+    assert [e["i"] for e in events] == [0, 1, 2, 3]
+
+
+def test_copilot_main_defaults_to_all_without_a_selector(monkeypatch, tmp_path):
+    called = {}
+
+    def fake_extract_all(conn, output, strict, raw, tool_result_max_bytes):
+        called["output"] = output
+        called["strict"] = strict
+        return 0
+
+    monkeypatch.setattr(copilot_log, "_extract_all", fake_extract_all)
+    monkeypatch.setattr(
+        copilot_log, "get_db_connection", lambda p: sqlite3.connect(":memory:")
+    )
+    rc = copilot_log.main(["--db", str(tmp_path / "x.db")])
+    assert rc == 0
+    assert called == {"output": None, "strict": False}
+
+
 if __name__ == "__main__":
+    test_copilot_skill_invocation_is_recorded_and_attributed()
+    print("✓ test_copilot_skill_invocation_is_recorded_and_attributed")
+
+    test_copilot_skill_definition_details_are_loaded()
+    print("✓ test_copilot_skill_definition_details_are_loaded")
+
     test_copilot_noise_cleaning()
     print("✓ test_copilot_noise_cleaning")
 

@@ -20,14 +20,14 @@ observable.
 
 Examples
 --------
-Most recent transcript for the current repository, written to
-``copilot_session_log.md`` in the project root::
+Every transcript for the current repository, one file per session (the default
+when no session selector is given), written into the project root::
 
     python3 scripts/extract_copilot_session_log.py
 
-Every transcript for the current repository, one file per session::
+The most recent transcript for the current repository, written to stdout::
 
-    python3 scripts/extract_copilot_session_log.py --all
+    python3 scripts/extract_copilot_session_log.py --output -
 
 A specific session id, to stdout::
 
@@ -45,6 +45,20 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from session_log_envelope import (
+    DEFAULT_TOOL_RESULT_MAX_BYTES,
+    assistant_event,
+    build_envelope,
+    image_from_bytes,
+    media_type_for_ext,
+    raw_filename,
+    tool_call,
+    unavailable_image,
+    user_event,
+    write_envelope,
+)
+from skill_metadata import load_skill_details, render_skill_lines
 
 COPILOT_DB = Path.home() / ".copilot" / "session-store.db"
 COPILOT_STATE_ROOT = Path.home() / ".copilot" / "session-state"
@@ -78,6 +92,89 @@ _IMAGE_EXT = {
     "image/svg+xml": "svg",
 }
 
+TOOL_DESC_MAX = 120
+RESULT_NOTE_MAX = 160
+
+
+def _decode_arguments(arguments: Any) -> Any:
+    if isinstance(arguments, str):
+        try:
+            return json.loads(arguments)
+        except json.JSONDecodeError:
+            return arguments
+    return arguments
+
+
+def tool_descriptor(name: str, arguments: Any) -> str:
+    """Summarize a tool call's most salient argument for a one-line bullet."""
+    args = _decode_arguments(arguments)
+    if not isinstance(args, dict):
+        return _truncate(str(args), TOOL_DESC_MAX) if args else ""
+
+    for key in (
+        "cmd",
+        "command",
+        "query",
+        "pattern",
+        "path",
+        "file_path",
+        "filePath",
+        "url",
+        "skill",
+    ):
+        val = args.get(key)
+        if isinstance(val, str) and val:
+            return _truncate(val, TOOL_DESC_MAX)
+
+    try:
+        return _truncate(json.dumps(args, ensure_ascii=False), TOOL_DESC_MAX)
+    except (TypeError, ValueError):
+        return ""
+
+
+def result_note(output: Any) -> str:
+    if isinstance(output, str):
+        return _truncate(output, RESULT_NOTE_MAX)
+    if output is None:
+        return ""
+    try:
+        return _truncate(json.dumps(output, ensure_ascii=False), RESULT_NOTE_MAX)
+    except (TypeError, ValueError):
+        return ""
+
+
+def skill_refs_from_call(name: str, arguments: Any) -> List[Dict[str, Optional[str]]]:
+    """Return skill names and definition paths evidenced by a tool call."""
+    args = _decode_arguments(arguments)
+    refs: List[Dict[str, Optional[str]]] = []
+
+    def add(value: str, path: Optional[str] = None) -> None:
+        for ref in refs:
+            if ref["name"] == value:
+                if path and not ref.get("path"):
+                    ref["path"] = path
+                return
+        refs.append({"name": value, "path": path})
+
+    short_name = name.rsplit(".", 1)[-1].lower()
+    if short_name in ("skill", "read_skill") and isinstance(args, dict):
+        value = args.get("skill") or args.get("name") or args.get("package")
+        if isinstance(value, str) and value:
+            add(value)
+
+    try:
+        blob = (
+            json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args
+        )
+    except (TypeError, ValueError):
+        blob = ""
+    skill_path = re.compile(r"(?P<path>[^\s\"']*/(?P<skill>[^/\s\"']+)/SKILL\.md)")
+    for match in skill_path.finditer(blob):
+        skill = match.group("skill")
+        if skill:
+            add(skill, match.group("path"))
+    return refs
+
 
 def _truncate(text: str, limit: int) -> str:
     text = " ".join(str(text).split())
@@ -108,14 +205,17 @@ def _parse_ts(ts: Optional[str]):
 
 
 def format_timestamp(ts: Optional[str]) -> str:
+    """Render as 'YYYY-MM-DD HH:MM:SS UTC' -- always UTC, never machine-local."""
+    from datetime import timezone
+
     if not ts or not isinstance(ts, str):
         return "(no timestamp)"
     dt = _parse_ts(ts)
     if dt is None:
         return ts
     if dt.tzinfo is not None:
-        dt = dt.astimezone()
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def format_elapsed(first_ts: Optional[str], ts: Optional[str]) -> str:
@@ -141,7 +241,11 @@ def date_only(ts: Optional[str]) -> str:
 
 class Turn:
     def __init__(
-        self, user_text: str, assistant_text: str, timestamp: Optional[str], turn_index: int
+        self,
+        user_text: str,
+        assistant_text: str,
+        timestamp: Optional[str],
+        turn_index: int,
     ):
         self.user_text = user_text
         self.assistant_text = assistant_text
@@ -149,14 +253,30 @@ class Turn:
         self.turn_index = turn_index
         self.shell_command: Optional[str] = None
         self.tool_bullets: List[str] = []
+        self.skills_used: List[str] = []
+        self.skill_details: Dict[str, Dict[str, Any]] = {}
         self.image_refs: List[Dict[str, str]] = []
         self.permission_decisions: List[Dict[str, Any]] = []
+        self.result_notes: List[str] = []
+        self.tool_calls: List[Dict[str, Any]] = []
 
     def add_tool(self, name: str, descriptor: str) -> None:
         if descriptor:
             self.tool_bullets.append(f"- {name} -> {descriptor}")
         else:
             self.tool_bullets.append(f"- {name}")
+
+    def add_result_note(self, note: str) -> None:
+        if note:
+            self.result_notes.append(note)
+
+    def add_skill(self, name: str, path: Optional[str] = None) -> None:
+        if name and name not in self.skills_used:
+            self.skills_used.append(name)
+        if name and (
+            name not in self.skill_details or (path and not self.skill_details[name])
+        ):
+            self.skill_details[name] = load_skill_details(name, path, PROJECT_ROOT)
 
 
 def get_db_connection(db_path: Path) -> sqlite3.Connection:
@@ -325,9 +445,7 @@ def get_session_files(
     return [dict(row) for row in cursor]
 
 
-def get_session_refs(
-    conn: sqlite3.Connection, session_id: str
-) -> List[Dict[str, Any]]:
+def get_session_refs(conn: sqlite3.Connection, session_id: str) -> List[Dict[str, Any]]:
     """Retrieve all refs (commits, PRs, issues) for a session."""
     cursor = conn.cursor()
     cursor.execute(
@@ -498,6 +616,181 @@ def get_state_permissions(session_id: str) -> List[Dict[str, Any]]:
     return _permissions_from_events(lines)
 
 
+def _skills_from_events(lines: List[str]) -> List[Dict[str, Any]]:
+    """Extract Copilot's first-class ``skill.invoked`` events."""
+    skills: List[Dict[str, Any]] = []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "skill.invoked":
+            continue
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            continue
+        name = data.get("name")
+        if isinstance(name, str) and name:
+            path = data.get("path")
+            skills.append(
+                {
+                    "name": name,
+                    "path": path if isinstance(path, str) else None,
+                    "timestamp": obj.get("timestamp"),
+                }
+            )
+    return skills
+
+
+def get_state_skills(session_id: str) -> List[Dict[str, Any]]:
+    """Read invoked skills from the per-session events log, if present."""
+    events_path = COPILOT_STATE_ROOT / session_id / "events.jsonl"
+    if not events_path.is_file():
+        return []
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return _skills_from_events(lines)
+
+
+def _result_text(result: Any) -> str:
+    """Flatten a ``tool.execution_complete`` result to plain text."""
+    if isinstance(result, dict):
+        for key in ("detailedContent", "content"):
+            val = result.get(key)
+            if isinstance(val, str) and val:
+                return val
+        return ""
+    if isinstance(result, str):
+        return result
+    if result is None:
+        return ""
+    try:
+        return json.dumps(result, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _tools_from_events(lines: List[str]) -> List[Dict[str, Any]]:
+    """Join ``tool.execution_start`` / ``tool.execution_complete`` events.
+
+    Copilot records the full tool call (name and arguments) and its result in the
+    per-session events log, so both are surfaced -- unlike the DB's
+    ``session_files`` table, which only lists edited paths. One record per call,
+    ordered by start time.
+    """
+    starts: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        etype = obj.get("type")
+        data = obj.get("data")
+        if not isinstance(data, dict):
+            continue
+
+        if etype == "tool.execution_start":
+            call_id = data.get("toolCallId")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            starts[call_id] = {
+                "call_id": call_id,
+                "name": data.get("toolName")
+                if isinstance(data.get("toolName"), str)
+                else "tool",
+                "arguments": data.get("arguments"),
+                "timestamp": obj.get("timestamp"),
+                "success": None,
+                "result": None,
+            }
+            order.append(call_id)
+        elif etype == "tool.execution_complete":
+            call_id = data.get("toolCallId")
+            rec = starts.get(call_id) if isinstance(call_id, str) else None
+            if rec is None:
+                continue
+            rec["success"] = data.get("success")
+            rec["result"] = _result_text(data.get("result"))
+
+    return [starts[cid] for cid in order]
+
+
+def get_state_tools(session_id: str) -> List[Dict[str, Any]]:
+    """Read tool calls + results from the per-session events log, if present."""
+    events_path = COPILOT_STATE_ROOT / session_id / "events.jsonl"
+    if not events_path.is_file():
+        return []
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return _tools_from_events(lines)
+
+
+def attribute_tools(turns: List[Turn], tools: List[Dict[str, Any]]) -> None:
+    """Fold each tool call under the latest turn at or before its timestamp.
+
+    Populates the markdown bullet, a structured record for the raw envelope, a
+    result note, and any skill evidenced by the call's arguments.
+    """
+    parsed = [(_parse_ts(t.timestamp), t) for t in turns]
+    for tool in tools:
+        called_at = _parse_ts(tool.get("timestamp"))
+        target: Optional[Turn] = None
+        if called_at is not None:
+            for turn_ts, turn in parsed:
+                if turn_ts is not None and turn_ts <= called_at:
+                    target = turn
+        if target is None and turns:
+            target = turns[0]
+        if target is None:
+            continue
+
+        name = tool.get("name") or "tool"
+        arguments = tool.get("arguments")
+        target.add_tool(str(name), tool_descriptor(str(name), arguments))
+        target.tool_calls.append(
+            {
+                "name": str(name),
+                "arguments": arguments,
+                "result": tool.get("result"),
+                "timestamp": tool.get("timestamp"),
+            }
+        )
+
+        note = result_note(tool.get("result"))
+        if tool.get("success") is False:
+            note = f"error: {note}" if note else "error"
+        if note:
+            target.add_result_note(f"{name}: {note}")
+
+        for skill_ref in skill_refs_from_call(str(name), arguments):
+            target.add_skill(str(skill_ref["name"]), skill_ref.get("path"))
+
+
+def attribute_skills(turns: List[Turn], skills: List[Dict[str, Any]]) -> None:
+    """Fold each skill invocation under the latest turn at or before its time."""
+    parsed = [(_parse_ts(t.timestamp), t) for t in turns]
+    for skill in skills:
+        invoked_at = _parse_ts(skill.get("timestamp"))
+        target: Optional[Turn] = None
+        if invoked_at is not None:
+            for turn_ts, turn in parsed:
+                if turn_ts is not None and turn_ts <= invoked_at:
+                    target = turn
+        if target is None and turns:
+            target = turns[0]
+        name = skill.get("name")
+        if target is not None and isinstance(name, str):
+            path = skill.get("path")
+            target.add_skill(name, path if isinstance(path, str) else None)
+
+
 def attribute_permissions(turns: List[Turn], perms: List[Dict[str, Any]]) -> None:
     """Fold each permission decision under the latest turn at or before its time."""
     parsed = [(_parse_ts(t.timestamp), t) for t in turns]
@@ -561,7 +854,9 @@ def _attachment_lookup(attachments: List[Dict[str, Any]]) -> Dict[str, Dict[str,
             continue
 
         type_value = item.get("type")
-        rec: Dict[str, str] = {"type": type_value if isinstance(type_value, str) else ""}
+        rec: Dict[str, str] = {
+            "type": type_value if isinstance(type_value, str) else ""
+        }
         if has_path and isinstance(raw_path, str):
             rec["path"] = raw_path
         if has_data_url and isinstance(item.get("data_url"), str):
@@ -628,6 +923,133 @@ def _build_turn_objects(
     return built
 
 
+def envelope_images(refs: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Resolve Copilot image refs to inline base64 entries.
+
+    Copilot records an image as a ``[image: name]`` token in the message text and
+    keeps the payload elsewhere — the SQLite ``attachments`` table or the
+    per-session events log — so a ref only resolves if that correlation found
+    something readable. Refs that do not resolve are recorded as unavailable,
+    which for Copilot is common enough to matter: an inline token with no
+    matching attachment record is exactly the case the markdown already flags.
+    """
+    images: List[Dict[str, Any]] = []
+    for ref in refs:
+        decoded = _image_bytes_and_ext(ref)
+        if decoded is None:
+            images.append(unavailable_image(ref.get("name") or ref.get("path")))
+            continue
+        raw, ext = decoded
+        images.append(image_from_bytes(raw, media_type_for_ext(ext)))
+    return images
+
+
+def build_events(
+    turns: List["Turn"],
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
+) -> List[Dict[str, Any]]:
+    """Produce raw-envelope events from already-built Copilot turns.
+
+    Copilot's store hands us whole turns rather than an event stream, so this
+    reads the Turn objects instead of re-walking a transcript.
+
+    **Call this before ``dump_images``** — that function appends image markers to
+    ``turn.user_text`` in place, and the envelope should carry the candidate's
+    text, not the markdown's annotation of it.
+
+    When a turn carries structured ``tool_calls`` (recovered from the events log),
+    each call becomes its own assistant event stamped with that call's own
+    timestamp -- mirroring Codex, where every tool call is a separate event -- and
+    its arguments and result are emitted in full (result capped at
+    ``tool_result_max_bytes``). Older turns that only have file-edit bullets fall
+    back to a single grouped assistant event with no per-call timestamp or result.
+    """
+    events: List[Dict[str, Any]] = []
+    index = 0
+
+    for turn in turns:
+        images = envelope_images(turn.image_refs)
+        if turn.user_text.strip() or images:
+            events.append(user_event(index, turn.timestamp, turn.user_text, images))
+            index += 1
+
+        if turn.tool_calls:
+            # One event per tool call, each with its own timestamp, so the stream
+            # matches Codex's granularity. Assistant prose (if any) leads.
+            if turn.assistant_text.strip():
+                events.append(
+                    assistant_event(index, turn.timestamp, turn.assistant_text)
+                )
+                index += 1
+            for tc in turn.tool_calls:
+                call = tool_call(
+                    tc["name"],
+                    tc.get("arguments"),
+                    tc.get("result"),
+                    tool_result_max_bytes,
+                )
+                events.append(
+                    assistant_event(
+                        index, tc.get("timestamp") or turn.timestamp, "", [call]
+                    )
+                )
+                index += 1
+        else:
+            calls = [
+                tool_call(name, {"target": target} if target else {})
+                for name, target in _tool_pairs(turn)
+            ]
+            if turn.assistant_text.strip() or calls:
+                events.append(
+                    assistant_event(index, turn.timestamp, turn.assistant_text, calls)
+                )
+                index += 1
+
+    return events
+
+
+def _tool_pairs(turn: "Turn") -> List[tuple]:
+    """Recover (tool name, target) from a turn's rendered tool bullets.
+
+    ``Turn.add_tool`` is the only place the pair is kept, and it stores the
+    rendered ``- name -> target`` string. Parsing it back is uglier than keeping
+    the structured pair, but changing ``Turn`` would risk the markdown.
+    """
+    pairs = []
+    for bullet in turn.tool_bullets:
+        body = bullet[2:] if bullet.startswith("- ") else bullet
+        name, sep, target = body.partition(" -> ")
+        pairs.append((name.strip(), target.strip() if sep else ""))
+    return pairs
+
+
+def write_raw_envelope(
+    session: Dict[str, Any],
+    turns: List["Turn"],
+    models: List[str],
+    out_dir: Path,
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
+) -> Optional[Path]:
+    """Write the raw envelope for one Copilot session."""
+    events = build_events(turns, tool_result_max_bytes)
+    if not events:
+        return None
+
+    session_id = output_identifier(session)
+    envelope = build_envelope(
+        harness="copilot",
+        session_id=session_id,
+        events=events,
+        cwd=session.get("cwd"),
+        started_at=session.get("created_at"),
+        models=models,
+        tool_result_max_bytes=tool_result_max_bytes,
+    )
+    out_path = out_dir / raw_filename("copilot", session_id)
+    write_envelope(out_path, envelope)
+    return out_path
+
+
 def _image_bytes_and_ext(ref: Dict[str, str]) -> Optional[tuple[bytes, str]]:
     data_url = ref.get("data_url")
     if isinstance(data_url, str) and data_url:
@@ -647,7 +1069,9 @@ def _image_bytes_and_ext(ref: Dict[str, str]) -> Optional[tuple[bytes, str]]:
         except (ValueError, TypeError):
             return None
         media_type = ref.get("media_type") or ref.get("type")
-        ext = _IMAGE_EXT.get(media_type, "img") if isinstance(media_type, str) else "img"
+        ext = (
+            _IMAGE_EXT.get(media_type, "img") if isinstance(media_type, str) else "img"
+        )
         return raw, ext
 
     source_path = ref.get("path")
@@ -728,8 +1152,13 @@ def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
             for line in turn.user_text.splitlines():
                 out.append(f"> {line}" if line.strip() else ">")
         out.append("")
+        for skill in turn.skills_used:
+            out.extend(render_skill_lines(skill, turn.skill_details.get(skill)))
+            out.append("")
         for p in turn.permission_decisions:
-            out.append(f"_Permission {format_decision(p['decision'])}:_ **{_truncate(p['tool'], 120)}**")
+            out.append(
+                f"_Permission {format_decision(p['decision'])}:_ **{_truncate(p['tool'], 120)}**"
+            )
             if p.get("feedback"):
                 for line in p["feedback"].splitlines():
                     out.append(f"> {line}" if line.strip() else ">")
@@ -816,12 +1245,29 @@ def render(
             out.append("")
             out.extend(turn.tool_bullets)
 
+        if turn.skills_used:
+            out.append("")
+            for skill in turn.skills_used:
+                out.extend(
+                    render_skill_lines(
+                        skill, turn.skill_details.get(skill), indent="  "
+                    )
+                )
+
+        if turn.result_notes:
+            notes = "; ".join(turn.result_notes[:6])
+            extra = len(turn.result_notes) - 6
+            if extra > 0:
+                notes += f"; (+{extra} more results)"
+            out.append("")
+            out.append(f"  _results:_ {_truncate(notes, 500)}")
+
         if turn.permission_decisions:
             out.append("")
             for p in turn.permission_decisions:
                 line = f"  _permission {format_decision(p['decision'])}:_ {_truncate(p['tool'], 120)}"
                 if p.get("feedback"):
-                    line += f" -> \"{_truncate(p['feedback'], 160)}\""
+                    line += f' -> "{_truncate(p["feedback"], 160)}"'
                 out.append(line)
 
         out.append("")
@@ -891,8 +1337,16 @@ def _unique_identifier(base: str, used: set) -> str:
     return ident
 
 
-def render_session(conn: sqlite3.Connection, session: Dict[str, Any]) -> str:
-    """Load all data for a session and render it as markdown."""
+def render_session(
+    conn: sqlite3.Connection,
+    session: Dict[str, Any],
+    raw_output: Optional[Path] = None,
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
+) -> str:
+    """Load all data for a session and render it as markdown.
+
+    When ``raw_output`` is given, the raw envelope is also written there.
+    """
     session_id = session["id"]
     turns_raw = get_session_turns(conn, session_id)
     checkpoints = get_session_checkpoints(conn, session_id)
@@ -902,7 +1356,25 @@ def render_session(conn: sqlite3.Connection, session: Dict[str, Any]) -> str:
     attachments.extend(get_state_attachments(session_id))
     models = get_session_models(conn, session_id)
     turns = _build_turn_objects(turns_raw, files, attachments)
+    tools = get_state_tools(session_id)
+    if tools:
+        # The events log is a superset of the DB's file-edit list, carrying every
+        # tool call with its arguments and result. Prefer it, dropping the
+        # coarser file-only bullets so nothing is double-counted.
+        for turn in turns:
+            turn.tool_bullets = []
+        attribute_tools(turns, tools)
     attribute_permissions(turns, get_state_permissions(session_id))
+    attribute_skills(turns, get_state_skills(session_id))
+
+    # Before dump_images: it appends image markers to turn.user_text in place.
+    if raw_output is not None:
+        raw_path = write_raw_envelope(
+            session, turns, models, raw_output, tool_result_max_bytes
+        )
+        if raw_path is not None:
+            print(f"  wrote {raw_path}", file=sys.stderr)
+
     dump_images(turns, output_identifier(session))
 
     return render(
@@ -948,7 +1420,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "extract every session for the current repository into the current "
             "working directory, one file per session named "
             "copilot_session_log_<identifier>.md (in this mode --output is treated "
-            "as the output directory; positional selector is ignored)"
+            "as the output directory; positional selector is ignored). This is "
+            "the default when no session selector is supplied"
         ),
     )
     parser.add_argument(
@@ -961,11 +1434,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "directory instead (default: project root)."
         ),
     )
+    parser.add_argument(
+        "--raw",
+        dest="raw",
+        action="store_true",
+        default=True,
+        help=(
+            "also write the raw envelope "
+            "copilot_session_log_raw_<identifier>.json alongside the markdown, "
+            "carrying the full conversation with pasted images inlined as "
+            "base64 (default: on)"
+        ),
+    )
+    parser.add_argument(
+        "--no-raw",
+        dest="raw",
+        action="store_false",
+        help="skip the raw envelope and write only the markdown log",
+    )
+    parser.add_argument(
+        "--raw-tool-result-bytes",
+        metavar="N",
+        type=int,
+        default=DEFAULT_TOOL_RESULT_MAX_BYTES,
+        help=(
+            "cap each tool result in the raw envelope at N bytes; the original "
+            "size is always recorded. Use a negative value for no cap "
+            f"(default: {DEFAULT_TOOL_RESULT_MAX_BYTES})"
+        ),
+    )
     return parser
 
 
 def _extract_all(
-    conn: sqlite3.Connection, output: Optional[str], strict: bool = False
+    conn: sqlite3.Connection,
+    output: Optional[str],
+    strict: bool = False,
+    raw: bool = True,
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
 ) -> int:
     """Extract every matching Copilot session, one markdown file each."""
     cwd = Path.cwd()
@@ -990,7 +1496,12 @@ def _extract_all(
     for session in sessions:
         ident = _unique_identifier(output_identifier(session), used_ids)
         try:
-            markdown = render_session(conn, session)
+            markdown = render_session(
+                conn,
+                session,
+                raw_output=out_dir if raw else None,
+                tool_result_max_bytes=tool_result_max_bytes,
+            )
         except (OSError, ValueError) as exc:
             print(f"  skip {ident}: {exc}", file=sys.stderr)
             continue
@@ -1021,9 +1532,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     try:
-        if args.all:
+        default_all = not args.session and args.output != "-"
+        if args.all or default_all:
             out = None if args.output == "-" else args.output
-            return _extract_all(conn, out, strict=args.strict)
+            return _extract_all(
+                conn,
+                out,
+                strict=args.strict,
+                raw=args.raw,
+                tool_result_max_bytes=args.raw_tool_result_bytes,
+            )
 
         cwd = Path.cwd()
 
@@ -1050,8 +1568,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         print(f"using session: {session['id']}", file=sys.stderr)
 
+        # The envelope is a file, so there is nowhere to put it when the markdown
+        # is going to stdout. Write it next to the markdown otherwise.
+        if not args.raw or args.output == "-":
+            raw_output = None
+        elif args.output is None:
+            raw_output = DEFAULT_OUTPUT.parent
+        else:
+            raw_output = Path(args.output).expanduser().parent
+
         try:
-            markdown = render_session(conn, session)
+            markdown = render_session(
+                conn,
+                session,
+                raw_output=raw_output,
+                tool_result_max_bytes=args.raw_tool_result_bytes,
+            )
         except (OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -1062,7 +1594,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sys.stdout.write("\n")
         else:
             out_path = (
-                DEFAULT_OUTPUT if args.output is None else Path(args.output).expanduser()
+                DEFAULT_OUTPUT
+                if args.output is None
+                else Path(args.output).expanduser()
             )
             try:
                 out_path.write_text(markdown, encoding="utf-8")

@@ -26,16 +26,26 @@ When the human denies a tool's permission prompt, the decision is surfaced as a
 message the human typed). Approvals leave no distinct record -- an approved tool
 just runs -- so only denials are captured.
 
+Codex Plan mode is identified from the per-turn collaboration-mode metadata.
+Plan-mode turns are labeled in the output, and any structured ``update_plan``
+calls made during them are rendered in full rather than condensed to tool
+bullets. Unlike Claude Code's ``ExitPlanMode`` flow, Codex does not currently
+record a separate plan approval result; later approval or steering is captured
+as the next ordinary user turn.
+
 Examples
 --------
-Most recent transcript for the current project, written to
-``codex_session_log.md`` in the project root::
+Every transcript for the current project, one file per session::
 
     python3 scripts/extract_codex_session_log.py
 
-Every transcript for the current project, one file per session::
+The most recent matching transcript, written to stdout::
 
-    python3 scripts/extract_codex_session_log.py --all
+    python3 scripts/extract_codex_session_log.py --output -
+
+A specific session, written to one file::
+
+    python3 scripts/extract_codex_session_log.py <session-id> --output session.md
 """
 
 from __future__ import annotations
@@ -48,6 +58,25 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from session_log_envelope import (
+    DEFAULT_TOOL_RESULT_MAX_BYTES,
+    assistant_event,
+    build_envelope,
+    image_from_bytes,
+    media_type_for_ext,
+    raw_filename,
+    tool_call,
+    truncate_result,
+    unavailable_image,
+    user_event,
+    write_envelope,
+)
+from skill_metadata import (
+    load_command_details,
+    load_skill_details,
+    render_skill_lines,
+)
 
 
 CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
@@ -70,6 +99,11 @@ RESULT_NOTE_MAX = 160
 # namespaced tool names in logs, so matching is suffix-based in build_turns.
 INTERACTION_TOOLS = {"request_user_input"}
 
+# Codex can maintain a structured checklist through update_plan in either mode.
+# It represents plan output only when the surrounding turn is explicitly marked
+# as Plan mode; in Default mode it is an execution-progress tool.
+PLAN_TOOLS = {"update_plan"}
+
 _NOISE_TAG_BLOCK = re.compile(
     r"<(system-reminder|local-command-stdout|local-command-stderr|command-stdout|"
     r"command-stderr|command-name|command-message|command-args|task-notification|"
@@ -84,6 +118,13 @@ _NOISE_TAG_LOOSE = re.compile(
     re.IGNORECASE,
 )
 _BASH_INPUT = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL | re.IGNORECASE)
+_COMMAND_NAME = re.compile(
+    r"<command-name>\s*(.*?)\s*</command-name>", re.DOTALL | re.IGNORECASE
+)
+_COMMAND_ARGS = re.compile(
+    r"<command-args>\s*(.*?)\s*</command-args>", re.DOTALL | re.IGNORECASE
+)
+_SLASH_COMMAND = re.compile(r"^\s*(/[A-Za-z0-9][\w:.-]*)(?:\s+(.*?))?\s*$", re.DOTALL)
 _DATA_IMAGE_URL = re.compile(r"^data:(image/[A-Za-z0-9.+-]+);base64,(.*)$", re.DOTALL)
 
 # When the human denies a tool's permission prompt, the decision is fed back as
@@ -96,7 +137,9 @@ _PERMISSION_DENIAL_PREFIXES = (
     "The user doesn't want to proceed with this tool use.",
     "Permission for this tool use was denied.",
 )
-_EXT_AGENT_PREFIX = re.compile(r"^\[external_agent_tool_result[^\]]*\]\s*", re.IGNORECASE)
+_EXT_AGENT_PREFIX = re.compile(
+    r"^\[external_agent_tool_result[^\]]*\]\s*", re.IGNORECASE
+)
 _DENIAL_MESSAGE = re.compile(
     r"the user said:\s*\n?(.*?)(?:\n\nNote:|\Z)", re.DOTALL | re.IGNORECASE
 )
@@ -143,14 +186,17 @@ def _parse_ts(ts: Optional[str]):
 
 
 def format_timestamp(ts: Optional[str]) -> str:
+    """Render as 'YYYY-MM-DD HH:MM:SS UTC' -- always UTC, never machine-local."""
+    from datetime import timezone
+
     if not ts or not isinstance(ts, str):
         return "(no timestamp)"
     dt = _parse_ts(ts)
     if dt is None:
         return ts
     if dt.tzinfo is not None:
-        dt = dt.astimezone()
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def format_elapsed(first_ts: Optional[str], ts: Optional[str]) -> str:
@@ -270,7 +316,9 @@ def _paths_overlap(a: Path, b: Path) -> bool:
         return False
 
 
-def _cwd_matches(transcript_cwd: Optional[str], cwd: Path, strict: bool = False) -> bool:
+def _cwd_matches(
+    transcript_cwd: Optional[str], cwd: Path, strict: bool = False
+) -> bool:
     if not transcript_cwd:
         return False
     rec = Path(transcript_cwd).expanduser()
@@ -451,14 +499,17 @@ def image_refs_from_event(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                         {
                             "type": "base64",
                             "data": data,
-                            "media_type": item.get("media_type") or item.get("mime_type"),
+                            "media_type": item.get("media_type")
+                            or item.get("mime_type"),
                         }
                     )
 
     return refs
 
 
-def image_refs_from_user_message_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+def image_refs_from_user_message_payload(
+    payload: Dict[str, Any],
+) -> List[Dict[str, Any]]:
     """Base64 image refs from ``response_item`` user-message content."""
     refs: List[Dict[str, Any]] = []
     content = payload.get("content")
@@ -511,6 +562,52 @@ def tool_descriptor(name: str, arguments: Any) -> str:
         return ""
 
 
+def skill_refs_from_call(name: str, arguments: Any) -> List[Dict[str, Optional[str]]]:
+    """Return skill names and definition paths evidenced by a tool call."""
+    args = _decode_arguments(arguments)
+    refs: List[Dict[str, Optional[str]]] = []
+
+    def add(value: str, path: Optional[str] = None) -> None:
+        for ref in refs:
+            if ref["name"] == value:
+                if path and not ref.get("path"):
+                    ref["path"] = path
+                return
+        refs.append({"name": value, "path": path})
+
+    short_name = name.rsplit(".", 1)[-1].lower()
+
+    if short_name in ("skill", "read_skill"):
+        if isinstance(args, dict):
+            value = args.get("skill") or args.get("name") or args.get("package")
+            if isinstance(value, str) and value:
+                add(value)
+
+    normalized_name = name.lower().replace("__", ".")
+    if normalized_name.endswith("skills.read") and isinstance(args, dict):
+        value = args.get("package") or args.get("skill") or args.get("name")
+        if isinstance(value, str) and value:
+            add(value)
+
+    try:
+        blob = (
+            json.dumps(args, ensure_ascii=False) if not isinstance(args, str) else args
+        )
+    except (TypeError, ValueError):
+        blob = ""
+    skill_path = re.compile(r"(?P<path>[^\s\"']*/(?P<skill>[^/\s\"']+)/SKILL\.md)")
+    for match in skill_path.finditer(blob):
+        skill = match.group("skill")
+        if skill:
+            add(skill, match.group("path"))
+    return refs
+
+
+def skill_names_from_call(name: str, arguments: Any) -> List[str]:
+    """Return skill names evidenced by a call (backwards-compatible helper)."""
+    return [str(ref["name"]) for ref in skill_refs_from_call(name, arguments)]
+
+
 def result_note(output: Any) -> str:
     if isinstance(output, str):
         return _truncate(output, RESULT_NOTE_MAX)
@@ -522,6 +619,44 @@ def result_note(output: Any) -> str:
 
 def _is_interaction_tool(name: str) -> bool:
     return any(name == tool or name.endswith("." + tool) for tool in INTERACTION_TOOLS)
+
+
+def _is_plan_tool(name: str) -> bool:
+    return any(name == tool or name.endswith("." + tool) for tool in PLAN_TOOLS)
+
+
+def _collaboration_mode(payload: Dict[str, Any]) -> str:
+    """Return the normalized collaboration mode carried by a rollout event."""
+    mode = payload.get("collaboration_mode_kind")
+    if not isinstance(mode, str):
+        collaboration = payload.get("collaboration_mode")
+        if isinstance(collaboration, dict):
+            mode = collaboration.get("mode")
+    return mode.strip().lower() if isinstance(mode, str) else ""
+
+
+def _plan_update(arguments: Any) -> Optional[Dict[str, Any]]:
+    """Decode one structured update_plan call for first-class rendering."""
+    args = _decode_arguments(arguments)
+    if not isinstance(args, dict) or not isinstance(args.get("plan"), list):
+        return None
+    steps = []
+    for item in args["plan"]:
+        if not isinstance(item, dict) or not isinstance(item.get("step"), str):
+            continue
+        steps.append(
+            {
+                "step": item["step"],
+                "status": item.get("status", "pending"),
+            }
+        )
+    if not steps:
+        return None
+    explanation = args.get("explanation")
+    return {
+        "explanation": explanation if isinstance(explanation, str) else "",
+        "steps": steps,
+    }
 
 
 def _decode_jsonish(value: Any) -> Any:
@@ -719,23 +854,36 @@ def append_unique_path(paths: List[str], seen: set, path: str) -> None:
     if not path:
         return
     for existing in seen:
-        if existing == path or existing.endswith("/" + path) or path.endswith("/" + existing):
+        if (
+            existing == path
+            or existing.endswith("/" + path)
+            or path.endswith("/" + existing)
+        ):
             return
     seen.add(path)
     paths.append(path)
 
 
 class Turn:
-    def __init__(self, user_text: str, timestamp: Optional[str]):
+    def __init__(
+        self, user_text: str, timestamp: Optional[str], collaboration_mode: str = ""
+    ):
         self.user_text = user_text
         self.timestamp = timestamp
+        self.collaboration_mode = collaboration_mode
         self.images: List[Dict[str, Any]] = []
         self.shell_command: Optional[str] = None
+        self.command: Optional[str] = None
+        self.command_args: Optional[str] = None
+        self.command_details: Dict[str, Any] = {}
         self.assistant_text_blocks: List[str] = []
         self.tool_bullets: List[str] = []
+        self.skills_used: List[str] = []
+        self.skill_details: Dict[str, Dict[str, Any]] = {}
         self.result_notes: List[str] = []
         self.option_qas: List[Dict[str, Any]] = []
         self.permission_denials: List[Dict[str, Any]] = []  # denied tool + message
+        self.plan_updates: List[Dict[str, Any]] = []
 
     def add_assistant_text(self, text: str) -> None:
         if text and text.strip():
@@ -746,6 +894,19 @@ class Turn:
             self.tool_bullets.append(f"- {name} -> {descriptor}")
         else:
             self.tool_bullets.append(f"- {name}")
+
+    def add_skill(self, name: str, path: Optional[str] = None) -> None:
+        if name and name not in self.skills_used:
+            self.skills_used.append(name)
+        if name and (
+            name not in self.skill_details or (path and not self.skill_details[name])
+        ):
+            self.skill_details[name] = load_skill_details(name, path, PROJECT_ROOT)
+
+    def add_command(self, name: str, args: str = "") -> None:
+        self.command = name
+        self.command_args = args or None
+        self.command_details = load_command_details(name, PROJECT_ROOT)
 
     def add_result_note(self, note: str) -> None:
         if note:
@@ -759,23 +920,56 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
     current: Optional[Turn] = None
     call_names: Dict[str, str] = {}
     pending_questions: Dict[str, List[Any]] = {}
+    pending_plan_calls = set()
     pending_user_images: List[Dict[str, Any]] = []
     last_tool = ""  # most recent tool call, to name a denied permission
+    pending_mode = ""
 
     for entry in entries:
         etype = entry.get("type")
         payload = _payload(entry)
         ptype = payload.get("type")
 
+        mode = _collaboration_mode(payload)
+        if mode:
+            pending_mode = mode
+
+        if etype == "turn_context":
+            # Context describes the next/active task but is not conversational.
+            if current is not None and mode and not current.collaboration_mode:
+                current.collaboration_mode = mode
+            continue
+
         if etype == "event_msg":
             if ptype == "user_message":
                 text = user_text_from_event(payload)
+                raw_text = (
+                    payload.get("message")
+                    if isinstance(payload.get("message"), str)
+                    else text
+                )
                 images = pending_user_images or image_refs_from_event(payload)
                 pending_user_images = []
-                if not text and not images:
+                tagged_command = _COMMAND_NAME.search(raw_text)
+                slash_command = _SLASH_COMMAND.match(text)
+                command = ""
+                command_args = ""
+                if tagged_command:
+                    command = tagged_command.group(1).strip()
+                    args_match = _COMMAND_ARGS.search(raw_text)
+                    command_args = args_match.group(1).strip() if args_match else ""
+                elif slash_command:
+                    command = slash_command.group(1)
+                    command_args = (slash_command.group(2) or "").strip()
+                if command and not command.startswith("/"):
+                    command = ""
+                if not text and not images and not command:
                     continue
-                current = Turn(text, entry.get("timestamp"))
+                current = Turn(text, entry.get("timestamp"), pending_mode)
                 current.images = images
+                if command:
+                    current.user_text = ""
+                    current.add_command(command, command_args)
                 cmds = [c.strip() for c in _BASH_INPUT.findall(text) if c.strip()]
                 if cmds:
                     current.shell_command = "\n".join(cmds)
@@ -809,7 +1003,7 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
                 continue
             if role == "assistant":
                 if current is None:
-                    current = Turn("", entry.get("timestamp"))
+                    current = Turn("", entry.get("timestamp"), pending_mode)
                     turns.append(current)
                 text = assistant_text_from_payload(payload)
                 message = parse_permission_denial(text)
@@ -825,9 +1019,11 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
 
         if ptype in ("function_call", "custom_tool_call"):
             if current is None:
-                current = Turn("", entry.get("timestamp"))
+                current = Turn("", entry.get("timestamp"), pending_mode)
                 turns.append(current)
-            name = payload.get("name") if isinstance(payload.get("name"), str) else "tool"
+            name = (
+                payload.get("name") if isinstance(payload.get("name"), str) else "tool"
+            )
             last_tool = name
             call_id = payload.get("call_id")
             if isinstance(call_id, str):
@@ -835,7 +1031,16 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
             arguments = payload.get("arguments")
             if arguments is None:
                 arguments = payload.get("input")
+            if current.collaboration_mode == "plan" and _is_plan_tool(name):
+                plan = _plan_update(arguments)
+                if plan:
+                    current.plan_updates.append(plan)
+                    if isinstance(call_id, str):
+                        pending_plan_calls.add(call_id)
+                    continue
             current.add_tool(name, tool_descriptor(name, arguments))
+            for skill_ref in skill_refs_from_call(name, arguments):
+                current.add_skill(str(skill_ref["name"]), skill_ref.get("path"))
             args = _decode_arguments(arguments)
 
             if isinstance(call_id, str) and _is_interaction_tool(name):
@@ -852,6 +1057,9 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
             if current is None:
                 continue
             call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id in pending_plan_calls:
+                pending_plan_calls.remove(call_id)
+                continue
             prefix = ""
             if isinstance(call_id, str) and call_id in call_names:
                 prefix = f"{call_names[call_id]}: "
@@ -869,6 +1077,132 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
             continue
 
     return turns, files_changed
+
+
+def envelope_images(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Resolve Codex image refs to inline base64 entries.
+
+    Codex records images out of band — as a filesystem path, a data URL, or raw
+    base64 — so every ref has to be resolved to bytes before it can travel with
+    the log. A ref that will not resolve (most often a path whose file has since
+    been deleted) is recorded as unavailable rather than dropped: "pasted a
+    screenshot we can no longer read" and "pasted nothing" are different facts,
+    and only one of them is about the candidate.
+    """
+    images: List[Dict[str, Any]] = []
+    for ref in refs:
+        decoded = _image_bytes_and_ext(ref)
+        if decoded is None:
+            images.append(unavailable_image(ref.get("path") or ref.get("type")))
+            continue
+        raw, ext = decoded
+        images.append(image_from_bytes(raw, media_type_for_ext(ext)))
+    return images
+
+
+def build_events(
+    entries: List[Dict[str, Any]],
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
+) -> List[Dict[str, Any]]:
+    """Walk Codex entries in order, producing raw-envelope events.
+
+    A second pass alongside ``build_turns``, deliberately not a refactor of it,
+    so the markdown stays byte-for-byte what it was.
+    """
+    events: List[Dict[str, Any]] = []
+    pending_calls: Dict[str, Dict[str, Any]] = {}
+    pending_user_images: List[Dict[str, Any]] = []
+    index = 0
+
+    for entry in entries:
+        etype = entry.get("type")
+        payload = _payload(entry)
+        ptype = payload.get("type")
+
+        if etype == "event_msg" and ptype == "user_message":
+            text = user_text_from_event(payload)
+            refs = pending_user_images or image_refs_from_event(payload)
+            pending_user_images = []
+            images = envelope_images(refs)
+            if not text and not images:
+                continue
+            events.append(user_event(index, entry.get("timestamp"), text, images))
+            index += 1
+            continue
+
+        if etype != "response_item":
+            continue
+
+        if ptype == "message":
+            role = payload.get("role")
+            if role == "user":
+                # The real user turn arrives as event_msg:user_message; this
+                # sibling item is where the durable image data lives.
+                pending_user_images = image_refs_from_user_message_payload(payload)
+                continue
+            if role == "assistant":
+                text = assistant_text_from_payload(payload)
+                if not text.strip():
+                    continue
+                events.append(assistant_event(index, entry.get("timestamp"), text))
+                index += 1
+            continue
+
+        if ptype in ("function_call", "custom_tool_call"):
+            name = (
+                payload.get("name") if isinstance(payload.get("name"), str) else "tool"
+            )
+            arguments = payload.get("arguments")
+            if arguments is None:
+                arguments = payload.get("input")
+            call = tool_call(
+                name, _decode_arguments(arguments), None, tool_result_max_bytes
+            )
+            events.append(assistant_event(index, entry.get("timestamp"), "", [call]))
+            index += 1
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str):
+                pending_calls[call_id] = call
+            continue
+
+        if ptype in ("function_call_output", "custom_tool_call_output"):
+            call = pending_calls.pop(payload.get("call_id"), None)
+            if call is None:
+                continue
+            call.update(
+                truncate_result(
+                    _flatten_result_text(payload.get("output")), tool_result_max_bytes
+                )
+            )
+            continue
+
+    return events
+
+
+def write_raw_envelope(
+    transcript: Path,
+    entries: List[Dict[str, Any]],
+    out_dir: Path,
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
+) -> Optional[Path]:
+    """Write the raw envelope for one Codex transcript."""
+    events = build_events(entries, tool_result_max_bytes)
+    if not events:
+        return None
+
+    session_id = output_identifier(transcript)
+    envelope = build_envelope(
+        harness="codex",
+        session_id=session_id,
+        events=events,
+        cwd=session_cwd_from_file(transcript),
+        started_at=first_timestamp(entries),
+        models=session_models(entries),
+        tool_result_max_bytes=tool_result_max_bytes,
+    )
+    out_path = out_dir / raw_filename("codex", session_id)
+    write_envelope(out_path, envelope)
+    return out_path
 
 
 def _image_bytes_and_ext(ref: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:
@@ -897,7 +1231,9 @@ def _image_bytes_and_ext(ref: Dict[str, Any]) -> Optional[Tuple[bytes, str]]:
         except (ValueError, TypeError):
             return None
         media_type = ref.get("media_type")
-        return raw, _IMAGE_EXT.get(media_type, "img") if isinstance(media_type, str) else "img"
+        return raw, _IMAGE_EXT.get(media_type, "img") if isinstance(
+            media_type, str
+        ) else "img"
 
     if kind == "path":
         path_value = ref.get("path")
@@ -934,8 +1270,7 @@ def dump_images(
             path.write_bytes(raw)
             written.append(path)
             turn.user_text = (
-                f"{turn.user_text}\n\n"
-                f"[Image dumped to `{path}` — description pending]"
+                f"{turn.user_text}\n\n[Image dumped to `{path}` — description pending]"
             ).strip()
     return written
 
@@ -977,16 +1312,36 @@ def derive_project_label(transcript: Path, entries: List[Dict[str, Any]]) -> str
 
 def _derive_context_line(turns: List[Turn]) -> str:
     for turn in turns:
+        if turn.command:
+            return f'a Codex session starting with command: "{turn.command}"'
         if turn.user_text.strip():
             first = _truncate(turn.user_text, 80)
-            return f"a Codex session starting with: \"{first}\""
+            return f'a Codex session starting with: "{first}"'
     return "a Codex session"
+
+
+def _quote(text: str) -> List[str]:
+    """Blockquote text so embedded markdown remains inside the log section."""
+    return [f"> {line}" if line.strip() else ">" for line in text.splitlines()]
+
+
+def _render_plan_update(plan: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    if plan.get("explanation"):
+        out.extend(_quote(plan["explanation"]))
+    for item in plan.get("steps", []):
+        status = item.get("status", "pending")
+        mark = "x" if status == "completed" else " "
+        out.append(f"- [{mark}] {item.get('step', '')} _({status})_")
+    return out
 
 
 def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
     """Render the up-front recap of every real user input."""
     out: List[str] = ["## Summary - user inputs", ""]
-    input_turns = [(i, t) for i, t in enumerate(turns, 1) if t.user_text.strip()]
+    input_turns = [
+        (i, t) for i, t in enumerate(turns, 1) if t.user_text.strip() or t.command
+    ]
     if not input_turns:
         out += ["_(No user inputs in this transcript.)_", ""]
         return out
@@ -1000,7 +1355,16 @@ def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
             f"({elapsed}, delta {delta})"
         )
         out.append("")
-        if turn.shell_command:
+        if turn.command:
+            head = f"Invoked command: **{turn.command}**"
+            if turn.command_args:
+                head += f" `{turn.command_args}`"
+            out.append(head)
+            out.append("")
+            out.extend(
+                render_skill_lines(turn.command, turn.command_details, kind="Command")
+            )
+        elif turn.shell_command:
             out.append("Ran shell command:")
             out.append("")
             out.append("```sh")
@@ -1010,6 +1374,21 @@ def render_summary(turns: List[Turn], first_ts: Optional[str]) -> List[str]:
             for line in turn.user_text.splitlines():
                 out.append(f"> {line}" if line.strip() else ">")
         out.append("")
+        if turn.collaboration_mode == "plan":
+            out.append("_Codex Plan mode turn._")
+            out.append("")
+
+        for skill in turn.skills_used:
+            out.extend(render_skill_lines(skill, turn.skill_details.get(skill)))
+            out.append("")
+
+        if turn.plan_updates:
+            out.append(
+                f"_Structured plan updated {len(turn.plan_updates)} "
+                f"time{'s' if len(turn.plan_updates) != 1 else ''}; latest state:_"
+            )
+            out.extend(_render_plan_update(turn.plan_updates[-1]))
+            out.append("")
 
         for qa in turn.option_qas:
             label = qa["header"] or "Question"
@@ -1076,7 +1455,21 @@ def render(
             header += f" ({elapsed} into session)"
         out.append(header)
         out.append("")
-        if turn.shell_command:
+        if turn.collaboration_mode == "plan":
+            out.append("**Mode:** Plan")
+            out.append("")
+        if turn.command:
+            head = f"**User invoked command:** {turn.command}"
+            if turn.command_args:
+                head += f" `{turn.command_args}`"
+            out.append(head)
+            out.append("")
+            out.extend(
+                render_skill_lines(
+                    turn.command, turn.command_details, indent="  ", kind="Command"
+                )
+            )
+        elif turn.shell_command:
             out.append("**User ran shell command:**")
             out.append("")
             out.append("```sh")
@@ -1091,7 +1484,7 @@ def render(
         if turn.assistant_text_blocks:
             assistant_body = "\n\n".join(turn.assistant_text_blocks)
             out.append(f"**Assistant:** {assistant_body}")
-        elif turn.tool_bullets:
+        elif turn.tool_bullets or turn.plan_updates:
             out.append("**Assistant:**")
         else:
             out.append("**Assistant:** _(no response captured)_")
@@ -1100,6 +1493,15 @@ def render(
             out.append("")
             out.extend(turn.tool_bullets)
 
+        if turn.skills_used:
+            out.append("")
+            for skill in turn.skills_used:
+                out.extend(
+                    render_skill_lines(
+                        skill, turn.skill_details.get(skill), indent="  "
+                    )
+                )
+
         if turn.result_notes:
             notes = "; ".join(turn.result_notes[:6])
             extra = len(turn.result_notes) - 6
@@ -1107,6 +1509,16 @@ def render(
                 notes += f"; (+{extra} more results)"
             out.append("")
             out.append(f"  _results:_ {_truncate(notes, 500)}")
+
+        if turn.plan_updates:
+            for number, plan in enumerate(turn.plan_updates, 1):
+                out.append("")
+                heading = "**Assistant updated the Plan mode plan:**"
+                if len(turn.plan_updates) > 1:
+                    heading = f"**Assistant updated the Plan mode plan ({number}):**"
+                out.append(heading)
+                out.append("")
+                out.extend(_render_plan_update(plan))
 
         if turn.option_qas:
             out.append("")
@@ -1124,7 +1536,7 @@ def render(
             for d in turn.permission_denials:
                 line = f"  _user denied permission:_ {d['tool']}"
                 if d["message"]:
-                    line += f" -> \"{_truncate(d['message'], 160)}\""
+                    line += f' -> "{_truncate(d["message"], 160)}"'
                 out.append(line)
 
         out.append("")
@@ -1151,10 +1563,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Selection precedence:\n"
+            "With no session selector, all matching project sessions are exported.\n"
+            "Single-session selection precedence:\n"
             "  --transcript PATH > positional file path > positional session id/prefix\n"
             "  > newest transcript whose recorded cwd overlaps the current cwd\n"
-            "  > newest transcript anywhere under ~/.codex/sessions."
+            "  > newest transcript anywhere under ~/.codex/sessions.\n"
+            "Use --output - without a selector to print only that newest session."
         ),
     )
     parser.add_argument(
@@ -1188,7 +1602,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "extract every Codex session whose recorded cwd overlaps the current "
             "working directory, one file per session named "
             "codex_session_log_<session-id>.md (in this mode --output is treated "
-            "as the output directory; positional selector is ignored)"
+            "as the output directory; positional selector is ignored). This is "
+            "the default when no session selector is supplied"
         ),
     )
     parser.add_argument(
@@ -1196,28 +1611,70 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=None,
         help=(
-            "output markdown file (default: codex_session_log.md in the project "
-            f"root, {DEFAULT_OUTPUT}; use '-' for stdout). With --all, an output "
-            "directory instead (default: project root)."
+            "for all-session extraction, the output directory (default: project "
+            "root); for a selected single session, the markdown file (default: "
+            f"{DEFAULT_OUTPUT}). Use '-' for stdout and the newest single session"
+        ),
+    )
+    parser.add_argument(
+        "--raw",
+        dest="raw",
+        action="store_true",
+        default=True,
+        help=(
+            "also write the raw envelope codex_session_log_raw_<session-id>.json "
+            "alongside the markdown, carrying the full conversation with pasted "
+            "images inlined as base64 (default: on)"
+        ),
+    )
+    parser.add_argument(
+        "--no-raw",
+        dest="raw",
+        action="store_false",
+        help="skip the raw envelope and write only the markdown log",
+    )
+    parser.add_argument(
+        "--raw-tool-result-bytes",
+        metavar="N",
+        type=int,
+        default=DEFAULT_TOOL_RESULT_MAX_BYTES,
+        help=(
+            "cap each tool result in the raw envelope at N bytes; the original "
+            "size is always recorded. Use a negative value for no cap "
+            f"(default: {DEFAULT_TOOL_RESULT_MAX_BYTES})"
         ),
     )
     return parser
 
 
-def render_transcript(transcript: Path) -> str:
-    """Parse one Codex transcript file and return its rendered markdown."""
+def render_transcript(
+    transcript: Path,
+    raw_output: Optional[Path] = None,
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
+) -> str:
+    """Parse one Codex transcript file and return its rendered markdown.
+
+    When ``raw_output`` is given, the raw envelope is also written there.
+    """
     entries = load_entries(transcript)
     if not entries:
         raise ValueError(f"no parseable JSON entries found in {transcript}")
     turns, files_changed = build_turns(entries)
     dump_images(turns, output_identifier(transcript))
-    return render(
+    markdown = render(
         turns=turns,
         files_changed=files_changed,
         project_label=derive_project_label(transcript, entries),
         first_ts=first_timestamp(entries),
         models=session_models(entries),
     )
+    if raw_output is not None:
+        raw_path = write_raw_envelope(
+            transcript, entries, raw_output, tool_result_max_bytes
+        )
+        if raw_path is not None:
+            print(f"  wrote {raw_path}", file=sys.stderr)
+    return markdown
 
 
 def _unique_identifier(base: str, used: set) -> str:
@@ -1231,7 +1688,11 @@ def _unique_identifier(base: str, used: set) -> str:
 
 
 def _extract_all(
-    sessions_root: Optional[str], output: Optional[str], strict: bool = False
+    sessions_root: Optional[str],
+    output: Optional[str],
+    strict: bool = False,
+    raw: bool = True,
+    tool_result_max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
 ) -> int:
     """Extract every matching Codex transcript, one markdown file each."""
     root = Path(sessions_root).expanduser() if sessions_root else CODEX_SESSIONS_ROOT
@@ -1256,7 +1717,11 @@ def _extract_all(
     for transcript in files:
         ident = _unique_identifier(output_identifier(transcript), used_ids)
         try:
-            markdown = render_transcript(transcript)
+            markdown = render_transcript(
+                transcript,
+                raw_output=out_dir if raw else None,
+                tool_result_max_bytes=tool_result_max_bytes,
+            )
         except (OSError, ValueError) as exc:
             print(f"  skip {ident}: {exc}", file=sys.stderr)
             continue
@@ -1278,9 +1743,16 @@ def _extract_all(
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    if args.all:
+    default_all = not args.session and not args.transcript and args.output != "-"
+    if args.all or default_all:
         out = None if args.output == "-" else args.output
-        return _extract_all(args.sessions_root, out, strict=args.strict)
+        return _extract_all(
+            args.sessions_root,
+            out,
+            strict=args.strict,
+            raw=args.raw,
+            tool_result_max_bytes=args.raw_tool_result_bytes,
+        )
 
     try:
         transcript = select_transcript(
@@ -1295,8 +1767,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"using transcript: {transcript}", file=sys.stderr)
 
+    # The envelope is a file, so there is nowhere to put it when the markdown is
+    # going to stdout. Write it next to the markdown otherwise.
+    if not args.raw or args.output == "-":
+        raw_output = None
+    elif args.output is None:
+        raw_output = DEFAULT_OUTPUT.parent
+    else:
+        raw_output = Path(args.output).expanduser().parent
+
     try:
-        markdown = render_transcript(transcript)
+        markdown = render_transcript(
+            transcript,
+            raw_output=raw_output,
+            tool_result_max_bytes=args.raw_tool_result_bytes,
+        )
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

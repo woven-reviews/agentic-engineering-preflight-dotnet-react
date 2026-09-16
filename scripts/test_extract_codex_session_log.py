@@ -13,12 +13,14 @@ import tempfile
 from pathlib import Path
 
 from extract_codex_session_log import (
+    build_events,
     build_turns,
     clean_user_text,
     dump_images,
     main,
     parse_permission_denial,
     render,
+    skill_names_from_call,
 )
 
 # 1x1 transparent PNG.
@@ -41,6 +43,87 @@ QUESTIONS = [
 ]
 
 
+def test_codex_structured_skill_call_is_recorded():
+    entries = [
+        {
+            "type": "event_msg",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "payload": {"type": "user_message", "message": "Make a PDF"},
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "payload": {
+                "type": "function_call",
+                "name": "skills.read",
+                "call_id": "skill-1",
+                "arguments": json.dumps({"package": "pdf:pdf"}),
+            },
+        },
+    ]
+    turns, _ = build_turns(entries)
+    assert turns[0].skills_used == ["pdf:pdf"]
+
+
+def test_codex_slash_command_is_recorded_and_rendered_like_claude():
+    entries = [
+        {
+            "type": "event_msg",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "payload": {
+                "type": "user_message",
+                "message": "/work-ticket QUAL-2012",
+            },
+        }
+    ]
+
+    turns, files_changed = build_turns(entries)
+
+    assert len(turns) == 1
+    assert turns[0].user_text == ""
+    assert turns[0].command == "/work-ticket"
+    assert turns[0].command_args == "QUAL-2012"
+
+    md = render(turns, files_changed, "project", "2026-01-01T00:00:00Z")
+    assert "Invoked command: **/work-ticket** `QUAL-2012`" in md
+    assert "_Command used:_ **/work-ticket**" in md
+    assert "**User invoked command:** /work-ticket `QUAL-2012`" in md
+
+
+def test_codex_tagged_slash_command_is_recorded():
+    entries = [
+        {
+            "type": "event_msg",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "payload": {
+                "type": "user_message",
+                "message": (
+                    "<command-name>/review</command-name>\n"
+                    "<command-message>review</command-message>\n"
+                    "<command-args>frontend src</command-args>"
+                ),
+            },
+        }
+    ]
+
+    turns, _ = build_turns(entries)
+
+    assert turns[0].command == "/review"
+    assert turns[0].command_args == "frontend src"
+
+
+def test_codex_skill_md_read_is_recorded():
+    args = {"cmd": "sed -n '1,200p' /tmp/plugins/documents/skills/documents/SKILL.md"}
+    assert skill_names_from_call("exec_command", args) == ["documents"]
+
+
+def test_codex_normalized_mcp_skill_read_is_recorded():
+    args = {"package": "presentations:Presentations"}
+    assert skill_names_from_call("mcp__skills__read", args) == [
+        "presentations:Presentations"
+    ]
+
+
 def test_codex_permission_denial_strips_external_prefix():
     c = (
         "[external_agent_tool_result: error]\nThe user doesn't want to proceed "
@@ -58,7 +141,9 @@ def test_codex_permission_denial_with_message():
 
 
 def test_codex_permission_denial_ignores_normal_text():
-    assert parse_permission_denial("[external_agent_tool_result]\nfile contents") is None
+    assert (
+        parse_permission_denial("[external_agent_tool_result]\nfile contents") is None
+    )
     assert parse_permission_denial("Sure, I'll do that.") is None
 
 
@@ -103,6 +188,112 @@ def test_codex_denial_recorded_on_turn_not_as_prose():
     ]
     # The canned denial text must not leak into assistant prose.
     assert turns[0].assistant_text_blocks == []
+
+
+def test_codex_plan_mode_turn_and_structured_plan_are_rendered():
+    entries = [
+        {
+            "type": "event_msg",
+            "timestamp": "2026-08-05T10:00:00Z",
+            "payload": {
+                "type": "task_started",
+                "collaboration_mode_kind": "plan",
+            },
+        },
+        {
+            "type": "turn_context",
+            "timestamp": "2026-08-05T10:00:01Z",
+            "payload": {"collaboration_mode": {"mode": "plan"}},
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-08-05T10:00:02Z",
+            "payload": {"type": "user_message", "message": "Plan the change"},
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-05T10:00:03Z",
+            "payload": {
+                "type": "function_call",
+                "name": "functions.update_plan",
+                "call_id": "plan-1",
+                "arguments": json.dumps(
+                    {
+                        "explanation": "Start with the schema.",
+                        "plan": [
+                            {"step": "Inspect schema", "status": "completed"},
+                            {"step": "Design change", "status": "in_progress"},
+                        ],
+                    }
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-05T10:00:04Z",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "plan-1",
+                "output": "Plan updated",
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-05T10:00:05Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Here is the plan."}],
+            },
+        },
+    ]
+
+    turns, files_changed = build_turns(entries)
+    assert turns[0].collaboration_mode == "plan"
+    assert turns[0].tool_bullets == []
+    assert turns[0].result_notes == []
+    assert turns[0].plan_updates[0]["steps"][1]["step"] == "Design change"
+
+    md = render(turns, files_changed, "project", "2026-08-05T10:00:00Z")
+    assert "_Codex Plan mode turn._" in md
+    assert "**Mode:** Plan" in md
+    assert "**Assistant updated the Plan mode plan:**" in md
+    assert "- [x] Inspect schema _(completed)_" in md
+    assert "- [ ] Design change _(in_progress)_" in md
+    assert "Here is the plan." in md
+
+
+def test_codex_default_mode_update_plan_remains_execution_tool():
+    entries = [
+        {
+            "type": "event_msg",
+            "timestamp": "2026-08-05T10:00:00Z",
+            "payload": {
+                "type": "task_started",
+                "collaboration_mode_kind": "default",
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-08-05T10:00:01Z",
+            "payload": {"type": "user_message", "message": "Build it"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "update_plan",
+                "call_id": "plan-1",
+                "arguments": json.dumps(
+                    {"plan": [{"step": "Implement", "status": "in_progress"}]}
+                ),
+            },
+        },
+    ]
+    turns, _ = build_turns(entries)
+    assert turns[0].collaboration_mode == "default"
+    assert turns[0].plan_updates == []
+    assert turns[0].tool_bullets[0].startswith("- update_plan")
 
 
 def test_codex_noise_cleaning():
@@ -309,10 +500,49 @@ def test_codex_all_extracts_matching_sessions_to_unique_files():
             "codex_session_log_session-one.md",
             "codex_session_log_session-two.md",
         ]
-        assert "First session" in (
-            out / "codex_session_log_session-one.md"
-        ).read_text(encoding="utf-8")
+        assert "First session" in (out / "codex_session_log_session-one.md").read_text(
+            encoding="utf-8"
+        )
         assert not (out / "codex_session_log_session-other.md").exists()
+
+
+def test_codex_no_selector_extracts_all_by_default():
+    with tempfile.TemporaryDirectory() as tmp_name:
+        tmp = Path(tmp_name)
+        project = tmp / "project"
+        sessions = tmp / "sessions" / "2026" / "01" / "01"
+        out = tmp / "out"
+        project.mkdir()
+
+        _write_jsonl(
+            sessions / "rollout-one.jsonl",
+            _session_entries("session-one", project, "First session"),
+        )
+        _write_jsonl(
+            sessions / "rollout-two.jsonl",
+            _session_entries("session-two", project, "Second session"),
+        )
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(project)
+            rc = main(
+                [
+                    "--sessions-root",
+                    str(tmp / "sessions"),
+                    "--output",
+                    str(out),
+                ]
+            )
+        finally:
+            os.chdir(old_cwd)
+
+        assert rc == 0
+        written = sorted(path.name for path in out.glob("codex_session_log_*.md"))
+        assert written == [
+            "codex_session_log_session-one.md",
+            "codex_session_log_session-two.md",
+        ]
 
 
 def test_codex_strict_requires_exact_cwd():
@@ -353,6 +583,89 @@ def test_codex_strict_requires_exact_cwd():
         # Strict drops the descendant; only the exact-cwd session survives.
         written = sorted(path.name for path in out.glob("codex_session_log_*.md"))
         assert written == ["codex_session_log_session-one.md"]
+
+
+def _codex_entries(image_path, missing_path="/gone/missing.png"):
+    return [
+        {"type": "session_meta", "payload": {"id": "sess-1", "cwd": "/work/app"}},
+        {
+            "type": "event_msg",
+            "timestamp": "2026-08-01T10:00:00Z",
+            "payload": {
+                "type": "user_message",
+                "message": "here is the mock",
+                "images": [str(image_path), missing_path],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-01T10:00:02Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "On it."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-01T10:00:03Z",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "call_id": "c1",
+                "arguments": json.dumps({"command": "ls -la"}),
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-08-01T10:00:04Z",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": "A" * 9000,
+            },
+        },
+    ]
+
+
+def _png_on_disk():
+    path = Path(tempfile.mkdtemp()) / "shot.png"
+    path.write_bytes(base64.b64decode(_PNG_B64))
+    return path
+
+
+def test_build_events_inlines_an_image_stored_as_a_path():
+    # Codex keeps images out of band, so the envelope is where they become
+    # portable.
+    img = _png_on_disk()
+    user = build_events(_codex_entries(img))[0]
+    assert user["role"] == "user"
+    assert base64.b64decode(user["images"][0]["data"]) == base64.b64decode(_PNG_B64)
+    assert user["images"][0]["media_type"] == "image/png"
+
+
+def test_build_events_records_an_unresolvable_image_rather_than_dropping_it():
+    # dump_images silently skips these; the envelope must not, or "pasted a
+    # screenshot we can no longer read" becomes indistinguishable from "pasted
+    # nothing".
+    user = build_events(_codex_entries(_png_on_disk()))[0]
+    assert user["images"][1] == {"unavailable": True, "ref": "/gone/missing.png"}
+
+
+def test_build_events_attaches_output_to_its_function_call():
+    events = build_events(_codex_entries(_png_on_disk()), tool_result_max_bytes=100)
+    call = next(c for e in events for c in e.get("tool_calls", []))
+    assert call["name"] == "shell"
+    assert call["input"] == {"command": "ls -la"}
+    assert call["result_bytes"] == 9000
+    assert call["result_truncated"] is True
+
+
+def test_build_events_does_not_disturb_the_markdown_turns():
+    entries = _codex_entries(_png_on_disk())
+    before = [t.user_text for t in build_turns(entries)[0]]
+    build_events(entries)
+    assert [t.user_text for t in build_turns(entries)[0]] == before
 
 
 if __name__ == "__main__":
