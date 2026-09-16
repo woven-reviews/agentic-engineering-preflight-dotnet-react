@@ -65,6 +65,50 @@ def test_codex_structured_skill_call_is_recorded():
     assert turns[0].skills_used == ["pdf:pdf"]
 
 
+def test_codex_initial_response_item_user_message_is_exported_once():
+    entries = [
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Initial task"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Working on it"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-01-01T00:00:02Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Follow up"}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-01-01T00:00:02Z",
+            "payload": {"type": "user_message", "message": "Follow up"},
+        },
+    ]
+
+    turns, _ = build_turns(entries)
+    assert [turn.user_text for turn in turns] == ["Initial task", "Follow up"]
+    assert [event["text"] for event in build_events(entries) if event["role"] == "user"] == [
+        "Initial task",
+        "Follow up",
+    ]
+
+
 def test_codex_slash_command_is_recorded_and_rendered_like_claude():
     entries = [
         {

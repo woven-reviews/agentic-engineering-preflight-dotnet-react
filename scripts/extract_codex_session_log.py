@@ -447,6 +447,20 @@ def user_text_from_event(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def user_text_from_response_item(payload: Dict[str, Any]) -> str:
+    """Text from Codex's user-role response item, used for initial prompts."""
+    return clean_user_text(_content_text(payload.get("content"), ("text",)).strip())
+
+
+def is_startup_context(text: str) -> bool:
+    """Codex sends its plugin and workspace context as a user-role item."""
+    return (
+        text.startswith("<recommended_plugins>")
+        and "# AGENTS.md instructions" in text
+        and "<environment_context>" in text
+    )
+
+
 def assistant_text_from_payload(payload: Dict[str, Any]) -> str:
     return _content_text(payload.get("content"), ("text", "output_text")).strip()
 
@@ -922,8 +936,49 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
     pending_questions: Dict[str, List[Any]] = {}
     pending_plan_calls = set()
     pending_user_images: List[Dict[str, Any]] = []
+    pending_response_user: Optional[Tuple[str, Optional[str], List[Dict[str, Any]]]] = None
     last_tool = ""  # most recent tool call, to name a denied permission
     pending_mode = ""
+
+    def start_user_turn(
+        text: str,
+        timestamp: Optional[str],
+        images: List[Dict[str, Any]],
+        raw_text: Optional[str] = None,
+    ) -> None:
+        nonlocal current, last_tool
+        raw_text = raw_text or text
+        tagged_command = _COMMAND_NAME.search(raw_text)
+        slash_command = _SLASH_COMMAND.match(text)
+        command = ""
+        command_args = ""
+        if tagged_command:
+            command = tagged_command.group(1).strip()
+            args_match = _COMMAND_ARGS.search(raw_text)
+            command_args = args_match.group(1).strip() if args_match else ""
+        elif slash_command:
+            command = slash_command.group(1)
+            command_args = (slash_command.group(2) or "").strip()
+        if command and not command.startswith("/"):
+            command = ""
+        if not text and not images and not command:
+            return
+        current = Turn(text, timestamp, pending_mode)
+        current.images = images
+        if command:
+            current.user_text = ""
+            current.add_command(command, command_args)
+        cmds = [c.strip() for c in _BASH_INPUT.findall(text) if c.strip()]
+        if cmds:
+            current.shell_command = "\n".join(cmds)
+        turns.append(current)
+        last_tool = ""
+
+    def flush_pending_response_user() -> None:
+        nonlocal pending_response_user
+        if pending_response_user is not None:
+            start_user_turn(*pending_response_user)
+            pending_response_user = None
 
     for entry in entries:
         etype = entry.get("type")
@@ -943,38 +998,20 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
         if etype == "event_msg":
             if ptype == "user_message":
                 text = user_text_from_event(payload)
-                raw_text = (
+                response_images: List[Dict[str, Any]] = []
+                if pending_response_user is not None:
+                    response_images = pending_response_user[2]
+                    pending_response_user = None
+                images = response_images or pending_user_images or image_refs_from_event(payload)
+                pending_user_images = []
+                start_user_turn(
+                    text,
+                    entry.get("timestamp"),
+                    images,
                     payload.get("message")
                     if isinstance(payload.get("message"), str)
-                    else text
+                    else text,
                 )
-                images = pending_user_images or image_refs_from_event(payload)
-                pending_user_images = []
-                tagged_command = _COMMAND_NAME.search(raw_text)
-                slash_command = _SLASH_COMMAND.match(text)
-                command = ""
-                command_args = ""
-                if tagged_command:
-                    command = tagged_command.group(1).strip()
-                    args_match = _COMMAND_ARGS.search(raw_text)
-                    command_args = args_match.group(1).strip() if args_match else ""
-                elif slash_command:
-                    command = slash_command.group(1)
-                    command_args = (slash_command.group(2) or "").strip()
-                if command and not command.startswith("/"):
-                    command = ""
-                if not text and not images and not command:
-                    continue
-                current = Turn(text, entry.get("timestamp"), pending_mode)
-                current.images = images
-                if command:
-                    current.user_text = ""
-                    current.add_command(command, command_args)
-                cmds = [c.strip() for c in _BASH_INPUT.findall(text) if c.strip()]
-                if cmds:
-                    current.shell_command = "\n".join(cmds)
-                turns.append(current)
-                last_tool = ""
                 continue
 
             if ptype == "patch_apply_end":
@@ -997,11 +1034,16 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
         if ptype == "message":
             role = payload.get("role")
             if role == "user":
-                # Codex emits the actual user turn as event_msg:user_message.
-                # The sibling response_item carries durable input_image data.
-                pending_user_images = image_refs_from_user_message_payload(payload)
+                text = user_text_from_response_item(payload)
+                images = image_refs_from_user_message_payload(payload)
+                if text and not is_startup_context(text):
+                    flush_pending_response_user()
+                    pending_response_user = (text, entry.get("timestamp"), images)
+                else:
+                    pending_user_images = images
                 continue
             if role == "assistant":
+                flush_pending_response_user()
                 if current is None:
                     current = Turn("", entry.get("timestamp"), pending_mode)
                     turns.append(current)
@@ -1018,6 +1060,7 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
             continue
 
         if ptype in ("function_call", "custom_tool_call"):
+            flush_pending_response_user()
             if current is None:
                 current = Turn("", entry.get("timestamp"), pending_mode)
                 turns.append(current)
@@ -1076,6 +1119,7 @@ def build_turns(entries: List[Dict[str, Any]]) -> Tuple[List[Turn], List[str]]:
                 current.add_result_note(prefix + note)
             continue
 
+    flush_pending_response_user()
     return turns, files_changed
 
 
@@ -1112,7 +1156,17 @@ def build_events(
     events: List[Dict[str, Any]] = []
     pending_calls: Dict[str, Dict[str, Any]] = {}
     pending_user_images: List[Dict[str, Any]] = []
+    pending_response_user: Optional[Tuple[str, Optional[str], List[Dict[str, Any]]]] = None
     index = 0
+
+    def flush_pending_response_user() -> None:
+        nonlocal pending_response_user, index
+        if pending_response_user is None:
+            return
+        text, timestamp, refs = pending_response_user
+        events.append(user_event(index, timestamp, text, envelope_images(refs)))
+        index += 1
+        pending_response_user = None
 
     for entry in entries:
         etype = entry.get("type")
@@ -1121,7 +1175,11 @@ def build_events(
 
         if etype == "event_msg" and ptype == "user_message":
             text = user_text_from_event(payload)
-            refs = pending_user_images or image_refs_from_event(payload)
+            response_refs: List[Dict[str, Any]] = []
+            if pending_response_user is not None:
+                response_refs = pending_response_user[2]
+                pending_response_user = None
+            refs = response_refs or pending_user_images or image_refs_from_event(payload)
             pending_user_images = []
             images = envelope_images(refs)
             if not text and not images:
@@ -1136,11 +1194,16 @@ def build_events(
         if ptype == "message":
             role = payload.get("role")
             if role == "user":
-                # The real user turn arrives as event_msg:user_message; this
-                # sibling item is where the durable image data lives.
-                pending_user_images = image_refs_from_user_message_payload(payload)
+                text = user_text_from_response_item(payload)
+                refs = image_refs_from_user_message_payload(payload)
+                if text and not is_startup_context(text):
+                    flush_pending_response_user()
+                    pending_response_user = (text, entry.get("timestamp"), refs)
+                else:
+                    pending_user_images = refs
                 continue
             if role == "assistant":
+                flush_pending_response_user()
                 text = assistant_text_from_payload(payload)
                 if not text.strip():
                     continue
@@ -1149,6 +1212,7 @@ def build_events(
             continue
 
         if ptype in ("function_call", "custom_tool_call"):
+            flush_pending_response_user()
             name = (
                 payload.get("name") if isinstance(payload.get("name"), str) else "tool"
             )
@@ -1176,6 +1240,7 @@ def build_events(
             )
             continue
 
+    flush_pending_response_user()
     return events
 
 
