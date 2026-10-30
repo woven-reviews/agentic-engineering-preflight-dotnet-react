@@ -32,6 +32,16 @@ served, reached the backend, and the backend reached Postgres.
   `FRONTEND_HOST_PORT` before running the command above.
 - **Slow first build** — expected; let it finish once.
 
+- **Windows: a script fails with `bad interpreter`, `$'\r': command not found`, or `no such file
+  or directory`.** Your copy was cloned before we fixed line endings, and `git pull` doesn't
+  rewrite files you already have. Delete the folder and clone again, or run this from the repo
+  root (it discards any local changes):
+
+  ```bash
+  git rm -r --cached -q .
+  git reset --hard
+  ```
+
 Tear down with `docker compose --profile dev down` (add `--volumes` if you also want to drop the
 database volume).
 
